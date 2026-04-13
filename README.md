@@ -25,10 +25,16 @@ A Telegram bot that pipes voice and text messages into Claude Code, with convers
 4. Tap **Approve** → Claude re-runs with full permissions and executes
 5. Tap **Reject** → Claude's text-only response is shown instead
 
+## Why this exists
+
+Claude Code normally requires you to be at your computer. This bridge lets you use it from anywhere via Telegram — on your phone, on the go, or from any device.
+
+**No API key needed.** The bridge uses the Claude Code CLI, which runs under your existing Claude subscription (Pro or Max). You're not charged per token — it uses the same session as if you were typing in your terminal.
+
 ## Requirements
 
 - Python 3.10+
-- [Claude Code CLI](https://claude.ai/code) installed and authenticated
+- [Claude Code CLI](https://claude.ai/code) installed and authenticated with your Claude subscription
 - A Telegram bot token (from [@BotFather](https://t.me/botfather))
 - Optional: faster-whisper for voice message support
 

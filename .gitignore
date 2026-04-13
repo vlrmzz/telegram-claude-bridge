@@ -54,3 +54,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Session state (persisted locally, not for version control)
+sessions.json

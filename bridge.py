@@ -44,7 +44,8 @@ ALLOWED_USERS = {
 }
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "sonnet")
-CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "120"))
+CLAUDE_PATH = os.getenv("CLAUDE_PATH", "claude")
+CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -53,7 +54,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # Per-chat state
-sessions: dict[int, str] = {}
+SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 chat_locks: dict[int, asyncio.Lock] = {}
 
 # Pending approval: request_id -> {chat_id, prompt, tools, fallback_text}
@@ -61,6 +62,25 @@ pending_approvals: dict[str, dict] = {}
 
 # Store the bot application globally
 _app: Application | None = None
+
+
+def _load_sessions() -> dict[int, str]:
+    if SESSIONS_FILE.exists():
+        try:
+            data = json.loads(SESSIONS_FILE.read_text())
+            return {int(k): v for k, v in data.items()}
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def _save_sessions():
+    SESSIONS_FILE.write_text(json.dumps(
+        {str(k): v for k, v in sessions.items()}, indent=2
+    ))
+
+
+sessions: dict[int, str] = _load_sessions()
 
 # ---------------------------------------------------------------------------
 # Whisper STT (lazy-loaded)
@@ -96,7 +116,7 @@ def _truncate(text: str, max_len: int = 500) -> str:
 async def _run_claude(prompt: str, session_id: str | None, skip_permissions: bool,
                       max_turns: int = 10) -> tuple[list[dict], str | None, str]:
     """Run claude CLI and return (parsed_messages, session_id, final_text)."""
-    cmd = ["claude", "-p", prompt,
+    cmd = [CLAUDE_PATH, "-p", prompt,
            "--output-format", "stream-json", "--verbose"]
 
     if session_id:
@@ -107,7 +127,7 @@ async def _run_claude(prompt: str, session_id: str | None, skip_permissions: boo
         cmd += ["--dangerously-skip-permissions"]
     cmd += ["--max-turns", str(max_turns)]
 
-    log.info("Running claude (skip_perms=%s)", skip_permissions)
+    log.info("Running claude (skip_perms=%s): %s", skip_permissions, " ".join(cmd))
 
     proc = await asyncio.create_subprocess_exec(
         *cmd,
@@ -117,6 +137,11 @@ async def _run_claude(prompt: str, session_id: str | None, skip_permissions: boo
     stdout, stderr = await asyncio.wait_for(
         proc.communicate(), timeout=CLAUDE_TIMEOUT
     )
+
+    if stderr:
+        log.warning("Claude stderr: %s", stderr.decode()[:500])
+    if proc.returncode != 0:
+        log.error("Claude exited with code %s", proc.returncode)
 
     messages = []
     new_session_id = session_id
@@ -176,20 +201,21 @@ def _format_tool_list(tools: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _execute_approved(chat_id: int, prompt: str):
+async def _execute_approved(chat_id: int, prompt: str, approval: dict):
     """Execute Claude with full permissions (called after approval)."""
     log.info("Executing with permissions — chat %s", chat_id)
     await _app.bot.send_message(chat_id=chat_id, text="⏳ Executing...")
 
     exec_messages, new_session_id, exec_result = await _run_claude(
         prompt=prompt,
-        session_id=None,  # Fresh run since denied session is tainted
+        session_id=approval.get("session_id_before"),
         skip_permissions=True,
         max_turns=10,
     )
 
     if new_session_id:
         sessions[chat_id] = new_session_id
+        _save_sessions()
 
     # Notify what tools were used
     tools_used = _extract_tool_calls(exec_messages)
@@ -234,7 +260,7 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
     if approved:
         await query.edit_message_text("✅ Approved — executing...")
         # Run execution in background so we don't block the callback
-        asyncio.create_task(_execute_approved(chat_id, approval["prompt"]))
+        asyncio.create_task(_execute_approved(chat_id, approval["prompt"], approval))
     else:
         await query.edit_message_text("❌ Rejected.")
         fallback = approval.get("fallback_text", "")
@@ -258,16 +284,17 @@ async def send_to_claude(text: str, chat_id: int):
         max_turns=10,
     )
 
-    if new_session_id:
-        sessions[chat_id] = new_session_id
-
     # Check if Claude tried to use any tools
     denied_tools = _extract_tool_calls(messages)
 
     if not denied_tools:
-        # No tools needed — return the direct answer
+        # No tools needed — save session and return the direct answer
+        if new_session_id:
+            sessions[chat_id] = new_session_id
+            _save_sessions()
         return result_text or "Claude returned an empty response."
 
+    # Tools needed — do NOT save the session yet (Step 2 will save it after execution)
     # Step 2: Show tools and ask for approval (non-blocking)
     request_id = str(uuid.uuid4())[:8]
     log.info("Step 2: Asking approval for %d tool(s) [%s]", len(denied_tools), request_id)
@@ -277,6 +304,7 @@ async def send_to_claude(text: str, chat_id: int):
         "prompt": text,
         "tools": denied_tools,
         "fallback_text": result_text,
+        "session_id_before": session_id,  # resume from before Step 1, not after
     }
 
     tool_text = _format_tool_list(denied_tools)
@@ -350,7 +378,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "I'll ask for your approval first.\n\n"
         "Commands:\n"
         "/reset - Start a new conversation\n"
-        "/session - Show current session info"
+        "/session - Show current session info\n"
+        "/resume <session_id> - Resume a specific session\n"
+        "/close - End current session"
     )
 
 
@@ -359,6 +389,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     sessions.pop(chat_id, None)
+    _save_sessions()
     await update.message.reply_text("Session cleared. Next message starts a fresh conversation.")
 
 
@@ -371,6 +402,19 @@ async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Session: `{sid}`", parse_mode="Markdown")
     else:
         await update.message.reply_text("No active session. Send a message to start one.")
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("Usage: `/resume <session_id>`", parse_mode="Markdown")
+        return
+    session_id = context.args[0]
+    sessions[chat_id] = session_id
+    _save_sessions()
+    await update.message.reply_text(f"Resumed session: `{session_id}`", parse_mode="Markdown")
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -423,6 +467,73 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(chunk)
 
 
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle photo/screenshot messages — save locally and pass path to Claude."""
+    if not is_allowed(update.effective_user.id):
+        return
+
+    chat_id = update.effective_chat.id
+    caption = update.message.caption or "Please analyze this screenshot."
+
+    # Download the highest resolution photo
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+
+    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+        tmp_path = tmp.name
+        await file.download_to_drive(tmp_path)
+
+    await update.message.reply_chat_action("typing")
+
+    # Run Claude directly with permissions so it can Read the image file
+    prompt = f"{caption}\n\nThe image is saved at: {tmp_path} — use the Read tool to view it."
+    messages, new_session_id, result_text = await _run_claude(
+        prompt=prompt,
+        session_id=sessions.get(chat_id),
+        skip_permissions=True,
+        max_turns=3,
+    )
+
+    os.unlink(tmp_path)
+
+    if new_session_id:
+        sessions[chat_id] = new_session_id
+        _save_sessions()
+
+    response = result_text or "Claude returned an empty response."
+    for chunk in split_message(response):
+        await update.message.reply_text(chunk)
+
+
+async def cmd_bash(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Run a bash command directly and return output."""
+    if not is_allowed(update.effective_user.id):
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: `/bash <command>`", parse_mode="Markdown")
+        return
+
+    command = " ".join(context.args)
+    log.info("Direct bash: %s", command)
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        output = stdout.decode().strip() or stderr.decode().strip() or "(no output)"
+    except asyncio.TimeoutError:
+        output = "⚠️ Command timed out after 30 seconds."
+    except Exception as e:
+        output = f"⚠️ Error: {e}"
+
+    for chunk in split_message(f"```\n{output}\n```"):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -440,7 +551,12 @@ def main():
     _app.add_handler(CommandHandler("start", cmd_start))
     _app.add_handler(CommandHandler("reset", cmd_reset))
     _app.add_handler(CommandHandler("session", cmd_session))
+    _app.add_handler(CommandHandler("resume", cmd_resume))
+    _app.add_handler(CommandHandler("close", cmd_reset))
+    _app.add_handler(CommandHandler("new", cmd_reset))
+    _app.add_handler(CommandHandler("bash", cmd_bash))
     _app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
+    _app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("Bridge started. Listening for Telegram messages...")

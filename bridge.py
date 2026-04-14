@@ -517,6 +517,48 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle document/file messages — save locally and pass path to Claude."""
+    if not is_allowed(update.effective_user.id):
+        return
+
+    chat_id = update.effective_chat.id
+    doc = update.message.document
+    caption = update.message.caption or f"Please analyze this file: {doc.file_name}"
+
+    file = await doc.get_file()
+    suffix = Path(doc.file_name).suffix if doc.file_name else ""
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp_path = tmp.name
+        await file.download_to_drive(tmp_path)
+
+    await update.message.reply_chat_action("typing")
+
+    prompt = f"{caption}\n\nThe file is saved at: {tmp_path} — use the Read tool to view it."
+    try:
+        messages, new_session_id, result_text = await _run_claude(
+            prompt=prompt,
+            session_id=sessions.get(chat_id),
+            skip_permissions=True,
+            max_turns=5,
+        )
+    except asyncio.TimeoutError:
+        os.unlink(tmp_path)
+        await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s.")
+        return
+
+    os.unlink(tmp_path)
+
+    if new_session_id:
+        sessions[chat_id] = new_session_id
+        _save_sessions()
+
+    response = result_text or "Claude returned an empty response."
+    for chunk in split_message(response):
+        await update.message.reply_text(chunk)
+
+
 async def cmd_bash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Run a bash command directly and return output."""
     if not is_allowed(update.effective_user.id):
@@ -569,6 +611,7 @@ def main():
     _app.add_handler(CommandHandler("bash", cmd_bash))
     _app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     _app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    _app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("Bridge started. Listening for Telegram messages...")

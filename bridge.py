@@ -275,9 +275,17 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
             )
 
 
+_PROMPT_PREFIX = (
+    "Important: always provide a complete, fresh answer. "
+    "Do not say 'already answered' or refer to previous responses — "
+    "just answer fully as if for the first time.\n\n"
+)
+
+
 async def send_to_claude(text: str, chat_id: int):
     """Two-step flow: try without permissions, ask approval if tools needed."""
     session_id = sessions.get(chat_id)
+    text = _PROMPT_PREFIX + text
 
     # Step 1: Run Claude in default mode (tools will be denied)
     log.info("Step 1: Planning — chat %s", chat_id)

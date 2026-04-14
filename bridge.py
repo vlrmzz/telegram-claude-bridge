@@ -134,9 +134,13 @@ async def _run_claude(prompt: str, session_id: str | None, skip_permissions: boo
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await asyncio.wait_for(
-        proc.communicate(), timeout=CLAUDE_TIMEOUT
-    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=CLAUDE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise asyncio.TimeoutError(f"Claude timed out after {CLAUDE_TIMEOUT}s")
 
     if stderr:
         log.warning("Claude stderr: %s", stderr.decode()[:500])
@@ -443,7 +447,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Heard: {transcript}", do_quote=True)
 
     await update.message.reply_chat_action("typing")
-    response = await send_to_claude(transcript, chat_id)
+    try:
+        response = await send_to_claude(transcript, chat_id)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
+        return
 
     # If None, we're waiting for approval (handled by callback)
     if response is not None:
@@ -459,7 +467,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
 
     await update.message.reply_chat_action("typing")
-    response = await send_to_claude(text, chat_id)
+    try:
+        response = await send_to_claude(text, chat_id)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
+        return
 
     # If None, we're waiting for approval (handled by callback)
     if response is not None:

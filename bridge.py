@@ -55,6 +55,8 @@ log = logging.getLogger(__name__)
 
 # Per-chat state
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
+SESSIONS_BABY_FILE = Path(__file__).parent / "sessions_baby.json"
+BABY_PROJECT_DIR = os.getenv("BABY_PROJECT_DIR", str(Path(__file__).parent))
 chat_locks: dict[int, asyncio.Lock] = {}
 
 # Pending approval: request_id -> {chat_id, prompt, tools, fallback_text}
@@ -63,11 +65,23 @@ pending_approvals: dict[str, dict] = {}
 # Store the bot application globally
 _app: Application | None = None
 
+_BABY_KEYWORDS = {
+    "feed", "feeding", "breast", "bottle", "formula", "milk", "pump", "pumped",
+    "poop", "poo", "pee", "diaper", "nappy", "sleep", "nap", "wake",
+    "temp", "temperature", "fever", "weight", "baby", "bebe", "bebé",
+    "tetta", "latte", "pannolino", "popò", "pipì", "biberon",
+}
 
-def _load_sessions() -> dict[int, str]:
-    if SESSIONS_FILE.exists():
+
+def _is_baby_message(text: str) -> bool:
+    words = set(text.lower().split())
+    return bool(words & _BABY_KEYWORDS)
+
+
+def _load_sessions(path: Path) -> dict[int, str]:
+    if path.exists():
         try:
-            data = json.loads(SESSIONS_FILE.read_text())
+            data = json.loads(path.read_text())
             return {int(k): v for k, v in data.items()}
         except (json.JSONDecodeError, ValueError):
             pass
@@ -78,9 +92,13 @@ def _save_sessions():
     SESSIONS_FILE.write_text(json.dumps(
         {str(k): v for k, v in sessions.items()}, indent=2
     ))
+    SESSIONS_BABY_FILE.write_text(json.dumps(
+        {str(k): v for k, v in sessions_baby.items()}, indent=2
+    ))
 
 
-sessions: dict[int, str] = _load_sessions()
+sessions: dict[int, str] = _load_sessions(SESSIONS_FILE)
+sessions_baby: dict[int, str] = _load_sessions(SESSIONS_BABY_FILE)
 
 # ---------------------------------------------------------------------------
 # Whisper STT (lazy-loaded)
@@ -218,7 +236,10 @@ async def _execute_approved(chat_id: int, prompt: str, approval: dict):
     )
 
     if new_session_id:
-        sessions[chat_id] = new_session_id
+        if approval.get("baby"):
+            sessions_baby[chat_id] = new_session_id
+        else:
+            sessions[chat_id] = new_session_id
         _save_sessions()
 
     # Notify what tools were used
@@ -283,8 +304,10 @@ _PROMPT_PREFIX = (
 
 
 async def send_to_claude(text: str, chat_id: int):
-    """Two-step flow: try without permissions, ask approval if tools needed."""
-    session_id = sessions.get(chat_id)
+    """Two-step flow: try without permissions, ask approval if tools needed.
+    Routes baby-related messages to a dedicated session."""
+    baby = _is_baby_message(text)
+    session_id = sessions_baby.get(chat_id) if baby else sessions.get(chat_id)
     text = _PROMPT_PREFIX + text
 
     # Step 1: Run Claude in default mode (tools will be denied)
@@ -302,12 +325,14 @@ async def send_to_claude(text: str, chat_id: int):
     if not denied_tools:
         # No tools needed — save session and return the direct answer
         if new_session_id:
-            sessions[chat_id] = new_session_id
+            if baby:
+                sessions_baby[chat_id] = new_session_id
+            else:
+                sessions[chat_id] = new_session_id
             _save_sessions()
         return result_text or "Claude returned an empty response."
 
     # Tools needed — do NOT save the session yet (Step 2 will save it after execution)
-    # Step 2: Show tools and ask for approval (non-blocking)
     request_id = str(uuid.uuid4())[:8]
     log.info("Step 2: Asking approval for %d tool(s) [%s]", len(denied_tools), request_id)
 
@@ -316,7 +341,8 @@ async def send_to_claude(text: str, chat_id: int):
         "prompt": text,
         "tools": denied_tools,
         "fallback_text": result_text,
-        "session_id_before": session_id,  # resume from before Step 1, not after
+        "session_id_before": session_id,
+        "baby": baby,
     }
 
     tool_text = _format_tool_list(denied_tools)

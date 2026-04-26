@@ -46,6 +46,67 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "sonnet")
 CLAUDE_PATH = os.getenv("CLAUDE_PATH", "claude")
 CLAUDE_TIMEOUT = int(os.getenv("CLAUDE_TIMEOUT", "300"))
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+import re as _re
+
+# Keywords that trigger auto web search
+_SEARCH_TRIGGERS = {
+    # English
+    "search", "latest", "news", "current", "today", "recent", "now",
+    "what's happening", "whats happening", "look up", "find out",
+    # Italian
+    "cerca", "ultime", "notizie", "recente", "adesso", "oggi", "attuale",
+    "cercami", "dimmi cosa", "cosa sta succedendo",
+    # Spanish/Portuguese
+    "busca", "buscar", "noticias", "reciente", "ahora", "hoy",
+}
+
+_SEARCH_TRIGGER_RE = _re.compile(
+    r'\b(' + '|'.join(_re.escape(k) for k in _SEARCH_TRIGGERS) + r')\b',
+    _re.IGNORECASE
+)
+
+
+def _needs_search(text: str) -> bool:
+    """Return True if the message likely needs a web search."""
+    return bool(_SEARCH_TRIGGER_RE.search(text))
+
+
+async def perplexity_search(query: str) -> str | None:
+    """Search the web using Perplexity sonar via OpenRouter. Returns formatted results or None."""
+    if not OPENROUTER_API_KEY:
+        log.warning("OPENROUTER_API_KEY not set — skipping search")
+        return None
+    try:
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
+        resp = await client.chat.completions.create(
+            model="perplexity/sonar",
+            messages=[{"role": "user", "content": query}],
+            max_tokens=800,
+        )
+        raw = resp.model_dump()
+        text = raw.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+
+        # Extract citations
+        citations = []
+        for choice in raw.get("choices", []):
+            for ann in choice.get("message", {}).get("annotations", []):
+                if ann.get("type") == "url_citation":
+                    uc = ann.get("url_citation", {})
+                    if uc.get("url"):
+                        citations.append(f"- [{uc.get('title', uc['url'])}]({uc['url']})")
+
+        result = f"**Web search results:**\n{text}"
+        if citations:
+            result += "\n\n**Sources:**\n" + "\n".join(citations[:5])
+        return result
+    except Exception as e:
+        log.warning("Perplexity search failed: %s", e)
+        return None
+
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -55,6 +116,9 @@ log = logging.getLogger(__name__)
 
 # Per-chat state
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
+PROJECT_SESSIONS_FILE = Path(__file__).parent / "project_sessions.json"
+ACTIVE_PROJECT_FILE = Path(__file__).parent / "active_project.json"
+WIKI_DIR = Path.home() / "resources"
 chat_locks: dict[int, asyncio.Lock] = {}
 
 # Pending approval: request_id -> {chat_id, prompt, tools, fallback_text}
@@ -80,7 +144,93 @@ def _save_sessions():
     ))
 
 
+def _load_project_sessions() -> dict[str, str]:
+    """Load named project sessions: '{chat_id}_{project}' -> session_id"""
+    if PROJECT_SESSIONS_FILE.exists():
+        try:
+            return json.loads(PROJECT_SESSIONS_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def _save_project_sessions():
+    PROJECT_SESSIONS_FILE.write_text(json.dumps(project_sessions, indent=2))
+
+
+def _load_active_projects() -> dict[int, str]:
+    """Load active project per chat_id"""
+    if ACTIVE_PROJECT_FILE.exists():
+        try:
+            data = json.loads(ACTIVE_PROJECT_FILE.read_text())
+            return {int(k): v for k, v in data.items()}
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def _save_active_projects():
+    ACTIVE_PROJECT_FILE.write_text(json.dumps(
+        {str(k): v for k, v in active_projects.items()}, indent=2
+    ))
+
+
+def _get_project_context(project: str) -> str | None:
+    """Load AGENTS.md for a project as context string."""
+    agents_file = WIKI_DIR / project / "AGENTS.md"
+    if agents_file.exists():
+        return agents_file.read_text()
+    return None
+
+
+def _list_projects() -> list[str]:
+    """List available projects (subdirs of WIKI_DIR with AGENTS.md)."""
+    if not WIKI_DIR.exists():
+        return []
+    return sorted(
+        d.name for d in WIKI_DIR.iterdir()
+        if d.is_dir() and (d / "AGENTS.md").exists()
+    )
+
+
 sessions: dict[int, str] = _load_sessions()
+project_sessions: dict[str, str] = _load_project_sessions()
+active_projects: dict[int, str] = _load_active_projects()
+
+# Per-chat voice mode (True = respond with audio)
+voice_enabled: dict[int, bool] = {}
+
+FFMPEG = "/opt/homebrew/bin/ffmpeg"
+
+
+async def _text_to_voice(text: str) -> str | None:
+    """Generate a voice message OGG file using edge-tts. Returns path or None."""
+    import edge_tts
+    # Strip markdown for cleaner audio
+    import re
+    clean = re.sub(r'[*_`#\[\]()]', '', text)
+    clean = re.sub(r'https?://\S+', 'link', clean)
+    clean = clean.strip()
+    if not clean:
+        return None
+    try:
+        mp3_path = tempfile.mktemp(suffix=".mp3")
+        ogg_path = tempfile.mktemp(suffix=".ogg")
+        communicate = edge_tts.Communicate(clean, voice="it-IT-DiegoNeural")
+        await communicate.save(mp3_path)
+        proc = await asyncio.create_subprocess_exec(
+            FFMPEG, "-y", "-i", mp3_path,
+            "-c:a", "libopus", "-b:a", "64k", ogg_path,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+        os.unlink(mp3_path)
+        return ogg_path if os.path.exists(ogg_path) else None
+    except Exception as e:
+        log.warning("TTS failed: %s", e)
+        return None
+
 
 # ---------------------------------------------------------------------------
 # Whisper STT (lazy-loaded)
@@ -284,8 +434,22 @@ _PROMPT_PREFIX = (
 
 async def send_to_claude(text: str, chat_id: int):
     """Two-step flow: try without permissions, ask approval if tools needed."""
-    session_id = sessions.get(chat_id)
-    text = _PROMPT_PREFIX + text
+    # Use project session if active, else default session
+    project = active_projects.get(chat_id)
+    if project:
+        proj_key = f"{chat_id}_{project}"
+        session_id = project_sessions.get(proj_key) or sessions.get(chat_id)
+    else:
+        session_id = sessions.get(chat_id)
+
+    # Prepend project context if active
+    context_prefix = ""
+    if project:
+        ctx = _get_project_context(project)
+        if ctx:
+            context_prefix = f"[Project context: {project}]\n\n{ctx}\n\n---\n\n"
+
+    text = _PROMPT_PREFIX + context_prefix + text
 
     # Step 1: Run Claude in default mode (tools will be denied)
     log.info("Step 1: Planning — chat %s", chat_id)
@@ -302,8 +466,12 @@ async def send_to_claude(text: str, chat_id: int):
     if not denied_tools:
         # No tools needed — save session and return the direct answer
         if new_session_id:
-            sessions[chat_id] = new_session_id
-            _save_sessions()
+            if project:
+                project_sessions[f"{chat_id}_{project}"] = new_session_id
+                _save_project_sessions()
+            else:
+                sessions[chat_id] = new_session_id
+                _save_sessions()
         return result_text or "Claude returned an empty response."
 
     # Tools needed — do NOT save the session yet (Step 2 will save it after execution)
@@ -391,7 +559,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/reset - Start a new conversation\n"
         "/session - Show current session info\n"
         "/resume <session_id> - Resume a specific session\n"
-        "/close - End current session"
+        "/close - End current session\n"
+        "/voice on|off - Toggle voice responses"
     )
 
 
@@ -451,19 +620,39 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Couldn't hear anything. Try again?")
         return
 
+    # Check for voice toggle commands in transcribed text
+    import re as _re
+    t_norm = _re.sub(r'[^\w\s/]', '', transcript.strip().lower().replace("-", " ").replace("_", " ")).strip()
+    if t_norm in ("voice on", "barra voice on"):
+        voice_enabled[chat_id] = True
+        await update.message.reply_text("🔊 Voice mode ON.")
+        return
+    if t_norm in ("voice off", "barra voice off"):
+        voice_enabled[chat_id] = False
+        await update.message.reply_text("🔇 Voice mode OFF.")
+        return
+
     await update.message.reply_text(f"Heard: {transcript}", do_quote=True)
 
     await update.message.reply_chat_action("typing")
+
+    # Auto web search if transcript triggers it
+    search_context = ""
+    if _needs_search(transcript) and OPENROUTER_API_KEY:
+        await update.message.reply_text("🔍 Searching the web...", do_quote=True)
+        results = await perplexity_search(transcript)
+        if results:
+            search_context = f"\n\n[Web search results for context:]\n{results}\n\n"
+
     try:
-        response = await send_to_claude(transcript, chat_id)
+        response = await send_to_claude(transcript + search_context, chat_id)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
         return
 
     # If None, we're waiting for approval (handled by callback)
     if response is not None:
-        for chunk in split_message(response):
-            await update.message.reply_text(chunk)
+        await _send_response(update, chat_id, response)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -473,17 +662,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     text = update.message.text
 
+    # Intercept voice toggle commands sent as plain text
+    import re as _re
+    normalized = text.strip().lower().replace("-", " ").replace("_", " ")
+    normalized = _re.sub(r'[^\w\s/]', '', normalized).strip()
+    if normalized in ("voice on", "barra voice on", "/voice on"):
+        voice_enabled[chat_id] = True
+        await update.message.reply_text("🔊 Voice mode ON.")
+        return
+    if normalized in ("voice off", "barra voice off", "/voice off"):
+        voice_enabled[chat_id] = False
+        await update.message.reply_text("🔇 Voice mode OFF.")
+        return
+
     await update.message.reply_chat_action("typing")
+
+    # Auto web search if message triggers it
+    search_context = ""
+    if _needs_search(text) and OPENROUTER_API_KEY:
+        await update.message.reply_text("🔍 Searching the web...", do_quote=True)
+        results = await perplexity_search(text)
+        if results:
+            search_context = f"\n\n[Web search results for context:]\n{results}\n\n"
+
     try:
-        response = await send_to_claude(text, chat_id)
+        response = await send_to_claude(text + search_context, chat_id)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
         return
 
     # If None, we're waiting for approval (handled by callback)
     if response is not None:
-        for chunk in split_message(response):
-            await update.message.reply_text(chunk)
+        await _send_response(update, chat_id, response)
 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -566,6 +776,128 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk)
 
 
+async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Explicit web search via Perplexity."""
+    if not is_allowed(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/search <query>`", parse_mode="Markdown")
+        return
+    chat_id = update.effective_chat.id
+    query = " ".join(context.args)
+    await update.message.reply_chat_action("typing")
+    await update.message.reply_text(f"🔍 Searching: _{query}_", parse_mode="Markdown")
+    results = await perplexity_search(query)
+    if not results:
+        await update.message.reply_text("Search failed or no results.")
+        return
+    # Also send to Claude for synthesis
+    prompt = f"{query}\n\n{results}"
+    try:
+        response = await send_to_claude(prompt, chat_id)
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s.")
+        return
+    if response is not None:
+        await _send_response(update, chat_id, response)
+
+
+async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switch to a named project session."""
+    if not is_allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+
+    if not context.args:
+        project = active_projects.get(chat_id)
+        if project:
+            await update.message.reply_text(f"Active project: *{project}*", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("No active project. Use `/use <project>` to switch.", parse_mode="Markdown")
+        return
+
+    project = context.args[0].lower()
+
+    if project in ("off", "none", "clear"):
+        active_projects.pop(chat_id, None)
+        _save_active_projects()
+        await update.message.reply_text("Project cleared — back to default session.")
+        return
+
+    available = _list_projects()
+    if project not in available:
+        await update.message.reply_text(
+            f"Unknown project: `{project}`\nAvailable: {', '.join(f'`{p}`' for p in available) or 'none'}",
+            parse_mode="Markdown",
+        )
+        return
+
+    active_projects[chat_id] = project
+    _save_active_projects()
+
+    proj_key = f"{chat_id}_{project}"
+    has_session = proj_key in project_sessions
+    await update.message.reply_text(
+        f"Switched to project *{project}*{'  (resuming session)' if has_session else '  (new session)'}",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_sessions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List available projects and active session info."""
+    if not is_allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    available = _list_projects()
+    active = active_projects.get(chat_id)
+
+    lines = ["*Available projects:*"]
+    for p in available:
+        proj_key = f"{chat_id}_{p}"
+        has_session = proj_key in project_sessions
+        marker = "▶ " if p == active else "  "
+        session_note = " (session active)" if has_session else ""
+        lines.append(f"{marker}`{p}`{session_note}")
+
+    if not available:
+        lines.append("_No projects found in ~/resources/_")
+
+    lines.append("")
+    lines.append(f"Active: *{active or 'none (default session)'}*")
+    lines.append("\nUse `/use <project>` to switch, `/use off` to clear.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
+async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    arg = (context.args[0] if context.args else "").lower()
+    if arg == "on":
+        voice_enabled[chat_id] = True
+        await update.message.reply_text("🔊 Voice mode ON — risposte audio attive.")
+    elif arg == "off":
+        voice_enabled[chat_id] = False
+        await update.message.reply_text("🔇 Voice mode OFF — risposte testuali.")
+    else:
+        status = "ON" if voice_enabled.get(chat_id) else "OFF"
+        await update.message.reply_text(f"Voice mode è {status}. Usa /voice on oppure /voice off.")
+
+
+async def _send_response(update: Update, chat_id: int, response: str):
+    """Send response as voice or text based on chat setting."""
+    if voice_enabled.get(chat_id):
+        ogg_path = await _text_to_voice(response)
+        if ogg_path:
+            with open(ogg_path, "rb") as f:
+                await update.message.reply_voice(voice=f)
+            os.unlink(ogg_path)
+            return
+    for chunk in split_message(response):
+        await update.message.reply_text(chunk)
+
+
 async def cmd_bash(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Run a bash command directly and return output."""
     if not is_allowed(update.effective_user.id):
@@ -616,6 +948,10 @@ def main():
     _app.add_handler(CommandHandler("close", cmd_reset))
     _app.add_handler(CommandHandler("new", cmd_reset))
     _app.add_handler(CommandHandler("bash", cmd_bash))
+    _app.add_handler(CommandHandler("search", cmd_search))
+    _app.add_handler(CommandHandler("voice", cmd_voice))
+    _app.add_handler(CommandHandler("use", cmd_use))
+    _app.add_handler(CommandHandler("sessions", cmd_sessions))
     _app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     _app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     _app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

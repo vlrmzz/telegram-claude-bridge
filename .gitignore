@@ -57,3 +57,15 @@ Thumbs.db
 
 # Session state (persisted locally, not for version control)
 sessions.json
+sessions_baby.json
+project_sessions.json
+active_project.json
+
+# Baby tracker
+baby_bot.py
+baby_data.json
+baby_sessions.json
+tmp/
+
+# Local Claude Code instructions
+CLAUDE.md

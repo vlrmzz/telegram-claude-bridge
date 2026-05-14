@@ -52,25 +52,26 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 import re as _re
 
 # Keywords that trigger auto web search
-_SEARCH_TRIGGERS = {
+# Explicit search phrases — must match as a phrase, not a lone word
+_SEARCH_TRIGGER_PHRASES = [
     # English
-    "search", "latest", "news", "current", "today", "recent", "now",
-    "what's happening", "whats happening", "look up", "find out",
+    r'search for\b', r'look up\b', r'find out\b', r'what.s happening',
+    r'latest news', r'current news', r'search the web',
     # Italian
-    "cerca", "ultime", "notizie", "recente", "adesso", "oggi", "attuale",
-    "cercami", "dimmi cosa", "cosa sta succedendo",
+    r'cerca su internet', r'cercami\b', r'cosa sta succedendo',
+    r'ultime notizie', r'cerca online',
     # Spanish/Portuguese
-    "busca", "buscar", "noticias", "reciente", "ahora", "hoy",
-}
+    r'busca en internet', r'buscar en la web', r'noticias de hoy',
+]
 
 _SEARCH_TRIGGER_RE = _re.compile(
-    r'\b(' + '|'.join(_re.escape(k) for k in _SEARCH_TRIGGERS) + r')\b',
+    '|'.join(_SEARCH_TRIGGER_PHRASES),
     _re.IGNORECASE
 )
 
 
 def _needs_search(text: str) -> bool:
-    """Return True if the message likely needs a web search."""
+    """Return True if the message explicitly requests a web search."""
     return bool(_SEARCH_TRIGGER_RE.search(text))
 
 
@@ -118,11 +119,19 @@ log = logging.getLogger(__name__)
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"
 PROJECT_SESSIONS_FILE = Path(__file__).parent / "project_sessions.json"
 ACTIVE_PROJECT_FILE = Path(__file__).parent / "active_project.json"
+TOPICS_FILE = Path(__file__).parent / "topics.json"
 WIKI_DIR = Path.home() / "resources"
 chat_locks: dict[int, asyncio.Lock] = {}
 
 # Pending approval: request_id -> {chat_id, prompt, tools, fallback_text}
 pending_approvals: dict[str, dict] = {}
+
+# Pending saves: save_id -> {tmp_path, response, original_name}
+pending_saves: dict[str, dict] = {}
+
+# Recently sent photos: (chat_id, file_path) -> timestamp, to prevent duplicate sends
+_recent_sends: dict[tuple, float] = {}
+_SEND_COOLDOWN = 60  # seconds
 
 # Store the bot application globally
 _app: Application | None = None
@@ -175,6 +184,20 @@ def _save_active_projects():
     ))
 
 
+def _load_topics() -> dict[str, str]:
+    """Load topic mappings: '{chat_id}_{thread_id}' -> project_name"""
+    if TOPICS_FILE.exists():
+        try:
+            return json.loads(TOPICS_FILE.read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def _save_topics():
+    TOPICS_FILE.write_text(json.dumps(topic_map, indent=2))
+
+
 def _get_project_context(project: str) -> str | None:
     """Load AGENTS.md for a project as context string."""
     agents_file = WIKI_DIR / project / "AGENTS.md"
@@ -193,9 +216,31 @@ def _list_projects() -> list[str]:
     )
 
 
+def _sanitize_project_name(name: str) -> str:
+    """Convert a topic name to a valid project key."""
+    import re
+    key = name.lower().replace(" ", "_").replace("-", "_")
+    return re.sub(r'[^\w]', '', key)
+
+
+def _resolve_project(chat_id: int, thread_id: int | None) -> str | None:
+    """Return project name for this chat+thread, or None for default session.
+
+    Priority:
+    1. topic_map entry for (chat_id, thread_id) — forum topic mapping
+    2. active_projects entry for chat_id — legacy /use <project> fallback
+    """
+    if thread_id is not None:
+        key = f"{chat_id}_{thread_id}"
+        if key in topic_map:
+            return topic_map[key]
+    return active_projects.get(chat_id)
+
+
 sessions: dict[int, str] = _load_sessions()
 project_sessions: dict[str, str] = _load_project_sessions()
 active_projects: dict[int, str] = _load_active_projects()
+topic_map: dict[str, str] = _load_topics()
 
 # Per-chat voice mode (True = respond with audio)
 voice_enabled: dict[int, bool] = {}
@@ -357,8 +402,10 @@ def _format_tool_list(tools: list[dict]) -> str:
 
 async def _execute_approved(chat_id: int, prompt: str, approval: dict):
     """Execute Claude with full permissions (called after approval)."""
-    log.info("Executing with permissions — chat %s", chat_id)
-    await _app.bot.send_message(chat_id=chat_id, text="⏳ Executing...")
+    thread_id = approval.get("thread_id")
+    log.info("Executing with permissions — chat %s thread %s", chat_id, thread_id)
+    await _app.bot.send_message(chat_id=chat_id, text="⏳ Executing...",
+                                message_thread_id=thread_id)
 
     exec_messages, new_session_id, exec_result = await _run_claude(
         prompt=prompt,
@@ -367,9 +414,15 @@ async def _execute_approved(chat_id: int, prompt: str, approval: dict):
         max_turns=10,
     )
 
+    # Save session to correct bucket (topic project or default)
+    project = _resolve_project(chat_id, thread_id)
     if new_session_id:
-        sessions[chat_id] = new_session_id
-        _save_sessions()
+        if project:
+            project_sessions[f"{chat_id}_{project}"] = new_session_id
+            _save_project_sessions()
+        else:
+            sessions[chat_id] = new_session_id
+            _save_sessions()
 
     # Notify what tools were used
     tools_used = _extract_tool_calls(exec_messages)
@@ -380,12 +433,15 @@ async def _execute_approved(chat_id: int, prompt: str, approval: dict):
             chat_id=chat_id,
             text=f"⚡ Tools used: {summary}",
             parse_mode="Markdown",
+            message_thread_id=thread_id,
         )
 
     # Send result
-    result = exec_result or "Claude returned an empty response."
+    label = project if project else "general"
+    result = f"[{label}]\n{exec_result or 'Claude returned an empty response.'}"
     for chunk in split_message(result):
-        await _app.bot.send_message(chat_id=chat_id, text=chunk)
+        await _app.bot.send_message(chat_id=chat_id, text=chunk,
+                                    message_thread_id=thread_id)
 
 
 async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -395,6 +451,43 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
 
     data = query.data
     log.info("Callback received: %s", data)
+
+    # Handle forum topic init buttons
+    if data.startswith("initagents_") or data.startswith("initskip_"):
+        parts = data.split("_", 2)
+        action = parts[0]
+        chat_id_str, thread_id_str = parts[1], parts[2]
+        cid, tid = int(chat_id_str), int(thread_id_str)
+        project = topic_map.get(f"{cid}_{tid}", "unknown")
+        if action == "initagents":
+            await query.edit_message_text(f"Initializing project `{project}`...", parse_mode="Markdown")
+            asyncio.create_task(_init_project_agents(cid, tid, project))
+        else:
+            await query.edit_message_text("Skipped. Messages will still route to a dedicated session.")
+        return
+
+    # Handle save/discard for captures
+    if data.startswith("save_") or data.startswith("discard_"):
+        action = "save" if data.startswith("save_") else "discard"
+        save_id = data[len(action)+1:]
+        if save_id not in pending_saves:
+            await query.edit_message_text("⚠️ Save request expired.")
+            return
+        entry = pending_saves.pop(save_id)
+        if action == "save":
+            try:
+                saved_path = _save_capture(entry["tmp_path"], entry["response"], original_name=entry["original_name"])
+                await query.edit_message_text(f"📁 Saved to: `{saved_path}`", parse_mode="Markdown")
+            except Exception as e:
+                await query.edit_message_text(f"⚠️ Save failed: {e}")
+        else:
+            await query.edit_message_text("🗑 Discarded.")
+        # Clean up temp file
+        try:
+            os.unlink(entry["tmp_path"])
+        except Exception:
+            pass
+        return
 
     if not (data.startswith("approve_") or data.startswith("reject_")):
         return
@@ -422,6 +515,7 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
             await _app.bot.send_message(
                 chat_id=chat_id,
                 text=f"Claude's response without tools:\n\n{fallback}",
+                message_thread_id=approval.get("thread_id"),
             )
 
 
@@ -432,10 +526,10 @@ _PROMPT_PREFIX = (
 )
 
 
-async def send_to_claude(text: str, chat_id: int):
+async def send_to_claude(text: str, chat_id: int, thread_id: int | None = None):
     """Two-step flow: try without permissions, ask approval if tools needed."""
-    # Use project session if active, else default session
-    project = active_projects.get(chat_id)
+    # Resolve project from forum topic first, then active_projects fallback
+    project = _resolve_project(chat_id, thread_id)
     if project:
         proj_key = f"{chat_id}_{project}"
         session_id = project_sessions.get(proj_key) or sessions.get(chat_id)
@@ -472,7 +566,9 @@ async def send_to_claude(text: str, chat_id: int):
             else:
                 sessions[chat_id] = new_session_id
                 _save_sessions()
-        return result_text or "Claude returned an empty response."
+        answer = result_text or "Claude returned an empty response."
+        label = project if project else "general"
+        return f"[{label}]\n{answer}"
 
     # Tools needed — do NOT save the session yet (Step 2 will save it after execution)
     request_id = str(uuid.uuid4())[:8]
@@ -480,6 +576,7 @@ async def send_to_claude(text: str, chat_id: int):
 
     pending_approvals[request_id] = {
         "chat_id": chat_id,
+        "thread_id": thread_id,
         "prompt": text,
         "tools": denied_tools,
         "fallback_text": result_text,
@@ -505,6 +602,7 @@ async def send_to_claude(text: str, chat_id: int):
         text=msg_text,
         parse_mode="Markdown",
         reply_markup=keyboard,
+        message_thread_id=thread_id,
     )
 
     # Return None to signal that we're waiting for approval
@@ -568,20 +666,35 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
-    sessions.pop(chat_id, None)
-    _save_sessions()
-    await update.message.reply_text("Session cleared. Next message starts a fresh conversation.")
+    thread_id = update.message.message_thread_id
+    project = _resolve_project(chat_id, thread_id)
+    if project:
+        proj_key = f"{chat_id}_{project}"
+        project_sessions.pop(proj_key, None)
+        _save_project_sessions()
+        await update.message.reply_text(f"Session cleared for project `{project}`.", parse_mode="Markdown")
+    else:
+        sessions.pop(chat_id, None)
+        _save_sessions()
+        await update.message.reply_text("Session cleared. Next message starts a fresh conversation.")
 
 
 async def cmd_session(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update.effective_user.id):
         return
     chat_id = update.effective_chat.id
-    sid = sessions.get(chat_id)
-    if sid:
-        await update.message.reply_text(f"Session: `{sid}`", parse_mode="Markdown")
+    thread_id = update.message.message_thread_id
+    project = _resolve_project(chat_id, thread_id)
+    if project:
+        sid = project_sessions.get(f"{chat_id}_{project}")
+        label = f"Project `{project}`"
     else:
-        await update.message.reply_text("No active session. Send a message to start one.")
+        sid = sessions.get(chat_id)
+        label = "Default session"
+    if sid:
+        await update.message.reply_text(f"{label}: `{sid}`", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(f"{label}: no active session.")
 
 
 async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -644,8 +757,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if results:
             search_context = f"\n\n[Web search results for context:]\n{results}\n\n"
 
+    thread_id = update.message.message_thread_id
     try:
-        response = await send_to_claude(transcript + search_context, chat_id)
+        response = await send_to_claude(transcript + search_context, chat_id, thread_id=thread_id)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
         return
@@ -685,8 +799,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if results:
             search_context = f"\n\n[Web search results for context:]\n{results}\n\n"
 
+    thread_id = update.message.message_thread_id
     try:
-        response = await send_to_claude(text + search_context, chat_id)
+        response = await send_to_claude(text + search_context, chat_id, thread_id=thread_id)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
         return
@@ -694,6 +809,60 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # If None, we're waiting for approval (handled by callback)
     if response is not None:
         await _send_response(update, chat_id, response)
+
+
+def _save_capture(src_path: str, analysis: str, original_name: str = "") -> str:
+    """Save a captured file to ~/resources/captures/ with a sidecar .md. Returns save path."""
+    import shutil
+    import re as _re
+    from datetime import date as _date
+
+    # Detect category from analysis text
+    text = analysis.lower()
+    if any(w in text for w in ["flight", "boarding pass", "airport", "hotel booking", "reservation", "passport", "itinerary", "departure", "arrival gate"]):
+        category = "travel"
+    elif any(w in text for w in ["receipt", "invoice", "total", "payment", "price", "chf", "eur", "usd", "purchase", "order"]):
+        category = "receipts"
+    elif any(w in text for w in ["health", "medical", "doctor", "prescription", "blood", "weight", "temperature"]):
+        category = "health"
+    elif any(w in text for w in ["arxiv", "paper", "transformer", "neural", "model", "dataset", "benchmark", "iclr", "neurips", "research"]):
+        category = "research"
+    elif any(w in text for w in ["idea", "note", "todo", "reminder", "plan", "thought"]):
+        category = "ideas"
+    else:
+        category = "general"
+
+    # Build filename slug from analysis (first 6 words)
+    words = _re.sub(r'[^\w\s]', '', analysis[:60]).split()[:6]
+    slug = "-".join(w.lower() for w in words if w) or "capture"
+    slug = slug[:50]
+
+    today = _date.today().isoformat()
+    suffix = Path(src_path).suffix or ".jpg"
+    base_name = f"{today}-{slug}"
+
+    # Ensure directory exists
+    capture_dir = WIKI_DIR / "captures" / category
+    capture_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy file
+    dest_path = capture_dir / f"{base_name}{suffix}"
+    # Avoid overwriting
+    counter = 1
+    while dest_path.exists():
+        dest_path = capture_dir / f"{base_name}-{counter}{suffix}"
+        counter += 1
+    shutil.copy2(src_path, dest_path)
+
+    # Write sidecar .md
+    md_path = dest_path.with_suffix(".md")
+    md_path.write_text(
+        f"---\ndate: {today}\ncategory: {category}\nfile: {dest_path.name}\n"
+        f"original: {original_name}\n---\n\n{analysis}\n"
+    )
+
+    log.info("Capture saved: %s", dest_path)
+    return str(dest_path)
 
 
 async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -714,24 +883,43 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_chat_action("typing")
 
+    thread_id = update.message.message_thread_id
+    project = _resolve_project(chat_id, thread_id)
+    if project:
+        session_id = project_sessions.get(f"{chat_id}_{project}") or sessions.get(chat_id)
+    else:
+        session_id = sessions.get(chat_id)
+
     # Run Claude directly with permissions so it can Read the image file
     prompt = f"{caption}\n\nThe image is saved at: {tmp_path} — use the Read tool to view it."
     messages, new_session_id, result_text = await _run_claude(
         prompt=prompt,
-        session_id=sessions.get(chat_id),
+        session_id=session_id,
         skip_permissions=True,
         max_turns=3,
     )
 
-    os.unlink(tmp_path)
+    response = result_text or "Claude returned an empty response."
 
     if new_session_id:
-        sessions[chat_id] = new_session_id
-        _save_sessions()
+        if project:
+            project_sessions[f"{chat_id}_{project}"] = new_session_id
+            _save_project_sessions()
+        else:
+            sessions[chat_id] = new_session_id
+            _save_sessions()
 
-    response = result_text or "Claude returned an empty response."
     for chunk in split_message(response):
         await update.message.reply_text(chunk)
+
+    # Ask whether to save — don't auto-save
+    save_id = str(uuid.uuid4())
+    pending_saves[save_id] = {"tmp_path": tmp_path, "response": response, "original_name": "photo.jpg"}
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💾 Save", callback_data=f"save_{save_id}"),
+        InlineKeyboardButton("🗑 Discard", callback_data=f"discard_{save_id}"),
+    ]])
+    await update.message.reply_text("Save this photo to captures?", reply_markup=keyboard)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -752,11 +940,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_chat_action("typing")
 
+    thread_id = update.message.message_thread_id
+    project = _resolve_project(chat_id, thread_id)
+    if project:
+        session_id = project_sessions.get(f"{chat_id}_{project}") or sessions.get(chat_id)
+    else:
+        session_id = sessions.get(chat_id)
+
     prompt = f"{caption}\n\nThe file is saved at: {tmp_path} — use the Read tool to view it."
     try:
         messages, new_session_id, result_text = await _run_claude(
             prompt=prompt,
-            session_id=sessions.get(chat_id),
+            session_id=session_id,
             skip_permissions=True,
             max_turns=5,
         )
@@ -765,15 +960,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s.")
         return
 
-    os.unlink(tmp_path)
+    response = result_text or "Claude returned an empty response."
 
     if new_session_id:
-        sessions[chat_id] = new_session_id
-        _save_sessions()
-
-    response = result_text or "Claude returned an empty response."
+        if project:
+            project_sessions[f"{chat_id}_{project}"] = new_session_id
+            _save_project_sessions()
+        else:
+            sessions[chat_id] = new_session_id
+            _save_sessions()
     for chunk in split_message(response):
         await update.message.reply_text(chunk)
+
+    # Ask whether to save — don't auto-save
+    original_name = doc.file_name or "document"
+    save_id = str(uuid.uuid4())
+    pending_saves[save_id] = {"tmp_path": tmp_path, "response": response, "original_name": original_name}
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💾 Save", callback_data=f"save_{save_id}"),
+        InlineKeyboardButton("🗑 Discard", callback_data=f"discard_{save_id}"),
+    ]])
+    await update.message.reply_text("Save this document to captures?", reply_markup=keyboard)
 
 
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -792,9 +999,10 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Search failed or no results.")
         return
     # Also send to Claude for synthesis
+    thread_id = update.message.message_thread_id
     prompt = f"{query}\n\n{results}"
     try:
-        response = await send_to_claude(prompt, chat_id)
+        response = await send_to_claude(prompt, chat_id, thread_id=thread_id)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s.")
         return
@@ -885,8 +1093,35 @@ async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Voice mode è {status}. Usa /voice on oppure /voice off.")
 
 
+_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+
+def _extract_image_paths(text: str) -> list[str]:
+    """Find local file paths in text that point to existing image files."""
+    import re
+    found = []
+    for m in re.finditer(r'(/(?:Users|home|tmp)/[^\s\)\]\'"]+)', text):
+        p = Path(m.group(1))
+        if p.suffix.lower() in _IMAGE_EXTS and p.exists():
+            found.append(str(p))
+    return list(dict.fromkeys(found))  # deduplicate, preserve order
+
+
 async def _send_response(update: Update, chat_id: int, response: str):
     """Send response as voice or text based on chat setting."""
+    import time
+    now = time.time()
+    # Auto-send any image paths found in the response, with cooldown dedup
+    for img_path in _extract_image_paths(response):
+        key = (chat_id, img_path)
+        if now - _recent_sends.get(key, 0) < _SEND_COOLDOWN:
+            continue  # already sent recently, skip
+        _recent_sends[key] = now
+        try:
+            with open(img_path, "rb") as f:
+                await update.message.reply_photo(photo=f)
+        except Exception:
+            pass
+
     if voice_enabled.get(chat_id):
         ogg_path = await _text_to_voice(response)
         if ogg_path:
@@ -927,6 +1162,194 @@ async def cmd_bash(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(chunk, parse_mode="Markdown")
 
 
+async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Search captures by keyword."""
+    if not is_allowed(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/find <query>`", parse_mode="Markdown")
+        return
+
+    query = " ".join(context.args)
+    captures_dir = WIKI_DIR / "captures"
+    if not captures_dir.exists():
+        await update.message.reply_text("No captures saved yet.")
+        return
+
+    results = []
+    for md_file in sorted(captures_dir.rglob("*.md"), reverse=True):
+        content = md_file.read_text()
+        if query.lower() in content.lower():
+            lines = [l for l in content.split("\n") if l.strip() and not l.startswith("---") and ":" not in l[:20]]
+            snippet = lines[0][:120] if lines else md_file.stem
+            # Find matching image file (same stem, any image extension)
+            image_path = None
+            for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".pdf"):
+                candidate = md_file.with_suffix(ext)
+                if candidate.exists():
+                    image_path = candidate
+                    break
+            results.append((md_file.stem, snippet, image_path))
+
+    if not results:
+        await update.message.reply_text(f"No captures found for: _{query}_", parse_mode="Markdown")
+        return
+
+    await update.message.reply_text(
+        f"🔍 *Found {len(results)} result(s) for \"{query}\"*",
+        parse_mode="Markdown"
+    )
+    for stem, snippet, image_path in results[:5]:
+        caption = f"`{stem}`\n{snippet}"
+        if image_path and image_path.suffix.lower() in (".jpg", ".jpeg", ".png", ".gif", ".webp"):
+            with open(image_path, "rb") as f:
+                await update.message.reply_photo(photo=f, caption=caption)
+        elif image_path and image_path.suffix.lower() == ".pdf":
+            with open(image_path, "rb") as f:
+                await update.message.reply_document(document=f, caption=caption)
+        else:
+            await update.message.reply_text(caption, parse_mode="Markdown")
+
+
+# ---------------------------------------------------------------------------
+# Forum topic handlers
+# ---------------------------------------------------------------------------
+async def handle_forum_topic_created(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Auto-register a new forum topic as a project session."""
+    if not is_allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id
+    topic_name = update.message.forum_topic_created.name
+    project = _sanitize_project_name(topic_name)
+
+    topic_key = f"{chat_id}_{thread_id}"
+    topic_map[topic_key] = project
+    _save_topics()
+    log.info("Forum topic registered: %s -> %s (thread %s)", topic_name, project, thread_id)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("📄 Init AGENTS.md", callback_data=f"initagents_{chat_id}_{thread_id}"),
+        InlineKeyboardButton("Skip", callback_data=f"initskip_{chat_id}_{thread_id}"),
+    ]])
+    await update.message.reply_text(
+        f"Topic *{topic_name}* registered as project `{project}`.\n"
+        f"Messages here will route to a dedicated Claude session.",
+        parse_mode="Markdown",
+        reply_markup=keyboard,
+    )
+
+
+async def _init_project_agents(chat_id: int, thread_id: int, project: str):
+    """Run Claude to create AGENTS.md for a new project."""
+    prompt = (
+        f"Create the directory ~/resources/{project}/ and write an AGENTS.md file "
+        f"for a project called '{project}'. Keep it brief: a one-line description and "
+        f"a placeholder for project-specific instructions. Just do it, no explanation."
+    )
+    _, new_session_id, result_text = await _run_claude(
+        prompt=prompt,
+        session_id=None,
+        skip_permissions=True,
+        max_turns=3,
+    )
+    if new_session_id:
+        project_sessions[f"{chat_id}_{project}"] = new_session_id
+        _save_project_sessions()
+    text = result_text or f"Project `{project}` initialized."
+    await _app.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        message_thread_id=thread_id,
+    )
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Register current topic to a project name, or list mappings.
+
+    Usage (from inside a topic): /setup <project_name>
+    Usage:                        /setup list
+    Usage:                        /setup remove
+    """
+    if not is_allowed(update.effective_user.id):
+        return
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id
+
+    if not context.args:
+        if thread_id is not None:
+            key = f"{chat_id}_{thread_id}"
+            current = topic_map.get(key)
+            if current:
+                await update.message.reply_text(
+                    f"This topic → `{current}`.\nUse `/setup <project>` to change or `/setup remove` to unmap.",
+                    parse_mode="Markdown",
+                )
+            else:
+                await update.message.reply_text(
+                    f"No mapping yet. Use `/setup <project>` to register this topic.\nThread ID: `{thread_id}`",
+                    parse_mode="Markdown",
+                )
+        else:
+            await _cmd_setup_list(update, chat_id)
+        return
+
+    arg = context.args[0].lower()
+
+    if arg == "list":
+        await _cmd_setup_list(update, chat_id)
+        return
+
+    if arg == "remove":
+        if thread_id is None:
+            await update.message.reply_text("Run this from inside a forum topic.")
+            return
+        removed = topic_map.pop(f"{chat_id}_{thread_id}", None)
+        _save_topics()
+        if removed:
+            await update.message.reply_text(f"Removed mapping (was `{removed}`).", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("This topic had no mapping.")
+        return
+
+    if thread_id is None:
+        await update.message.reply_text(
+            "Run `/setup <project>` from inside the forum topic you want to map.",
+            parse_mode="Markdown",
+        )
+        return
+
+    project = _sanitize_project_name(arg)
+    topic_map[f"{chat_id}_{thread_id}"] = project
+    _save_topics()
+
+    available = _list_projects()
+    note = " ✓ (AGENTS.md found)" if project in available else " (no AGENTS.md yet)"
+    await update.message.reply_text(
+        f"Topic mapped to project `{project}`{note}.",
+        parse_mode="Markdown",
+    )
+
+
+async def _cmd_setup_list(update: Update, chat_id: int):
+    """Show all topic→project mappings for this chat."""
+    prefix = f"{chat_id}_"
+    mappings = {k: v for k, v in topic_map.items() if k.startswith(prefix)}
+    if not mappings:
+        await update.message.reply_text(
+            "No topic mappings yet.\nGo to a forum topic and run `/setup <project>`.",
+            parse_mode="Markdown",
+        )
+        return
+    lines = ["*Registered topics:*"]
+    for key, project in sorted(mappings.items()):
+        tid = key.split("_", 1)[1]
+        has_session = f"{chat_id}_{project}" in project_sessions
+        note = " (session active)" if has_session else ""
+        lines.append(f"  Thread `{tid}` → `{project}`{note}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -952,9 +1375,12 @@ def main():
     _app.add_handler(CommandHandler("voice", cmd_voice))
     _app.add_handler(CommandHandler("use", cmd_use))
     _app.add_handler(CommandHandler("sessions", cmd_sessions))
+    _app.add_handler(CommandHandler("find", cmd_find))
+    _app.add_handler(CommandHandler("setup", cmd_setup))
     _app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     _app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     _app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    _app.add_handler(MessageHandler(filters.StatusUpdate.FORUM_TOPIC_CREATED, handle_forum_topic_created))
     _app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     log.info("Bridge started. Listening for Telegram messages...")

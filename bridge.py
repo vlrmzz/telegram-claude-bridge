@@ -404,7 +404,7 @@ async def _execute_approved(chat_id: int, prompt: str, approval: dict):
     """Execute Claude with full permissions (called after approval)."""
     thread_id = approval.get("thread_id")
     log.info("Executing with permissions — chat %s thread %s", chat_id, thread_id)
-    await _app.bot.send_message(chat_id=chat_id, text="⏳ Executing...",
+    await _app.bot.send_message(chat_id=chat_id, text="⏳ Running...",
                                 message_thread_id=thread_id)
 
     exec_messages, new_session_id, exec_result = await _run_claude(
@@ -423,18 +423,6 @@ async def _execute_approved(chat_id: int, prompt: str, approval: dict):
         else:
             sessions[chat_id] = new_session_id
             _save_sessions()
-
-    # Notify what tools were used
-    tools_used = _extract_tool_calls(exec_messages)
-    if tools_used:
-        tool_names = [t["name"] for t in tools_used]
-        summary = ", ".join(f"`{n}`" for n in tool_names)
-        await _app.bot.send_message(
-            chat_id=chat_id,
-            text=f"⚡ Tools used: {summary}",
-            parse_mode="Markdown",
-            message_thread_id=thread_id,
-        )
 
     # Send result
     label = project if project else "general"
@@ -509,14 +497,7 @@ async def handle_approval_callback(update: Update, context: ContextTypes.DEFAULT
         # Run execution in background so we don't block the callback
         asyncio.create_task(_execute_approved(chat_id, approval["prompt"], approval))
     else:
-        await query.edit_message_text("❌ Rejected.")
-        fallback = approval.get("fallback_text", "")
-        if fallback:
-            await _app.bot.send_message(
-                chat_id=chat_id,
-                text=f"Claude's response without tools:\n\n{fallback}",
-                message_thread_id=approval.get("thread_id"),
-            )
+        await query.edit_message_text("❌ Cancelled.")
 
 
 _PROMPT_PREFIX = (
@@ -527,86 +508,40 @@ _PROMPT_PREFIX = (
 
 
 async def send_to_claude(text: str, chat_id: int, thread_id: int | None = None):
-    """Two-step flow: try without permissions, ask approval if tools needed."""
-    # Resolve project from forum topic first, then active_projects fallback
+    """Run Claude with full permissions and return the response."""
     project = _resolve_project(chat_id, thread_id)
     if project:
         proj_key = f"{chat_id}_{project}"
-        session_id = project_sessions.get(proj_key) or sessions.get(chat_id)
+        session_id = project_sessions.get(proj_key)
     else:
         session_id = sessions.get(chat_id)
 
-    # Prepend project context if active
     context_prefix = ""
     if project:
         ctx = _get_project_context(project)
         if ctx:
             context_prefix = f"[Project context: {project}]\n\n{ctx}\n\n---\n\n"
 
-    text = _PROMPT_PREFIX + context_prefix + text
+    full_text = _PROMPT_PREFIX + context_prefix + text
 
-    # Step 1: Run Claude in default mode (tools will be denied)
-    log.info("Step 1: Planning — chat %s", chat_id)
     messages, new_session_id, result_text = await _run_claude(
-        prompt=text,
+        prompt=full_text,
         session_id=session_id,
-        skip_permissions=False,
+        skip_permissions=True,
         max_turns=10,
     )
 
-    # Check if Claude tried to use any tools
-    denied_tools = _extract_tool_calls(messages)
+    if new_session_id:
+        if project:
+            project_sessions[f"{chat_id}_{project}"] = new_session_id
+            _save_project_sessions()
+        else:
+            sessions[chat_id] = new_session_id
+            _save_sessions()
 
-    if not denied_tools:
-        # No tools needed — save session and return the direct answer
-        if new_session_id:
-            if project:
-                project_sessions[f"{chat_id}_{project}"] = new_session_id
-                _save_project_sessions()
-            else:
-                sessions[chat_id] = new_session_id
-                _save_sessions()
-        answer = result_text or "Claude returned an empty response."
-        label = project if project else "general"
-        return f"[{label}]\n{answer}"
-
-    # Tools needed — do NOT save the session yet (Step 2 will save it after execution)
-    request_id = str(uuid.uuid4())[:8]
-    log.info("Step 2: Asking approval for %d tool(s) [%s]", len(denied_tools), request_id)
-
-    pending_approvals[request_id] = {
-        "chat_id": chat_id,
-        "thread_id": thread_id,
-        "prompt": text,
-        "tools": denied_tools,
-        "fallback_text": result_text,
-        "session_id_before": session_id,
-    }
-
-    tool_text = _format_tool_list(denied_tools)
-    msg_text = (
-        f"🔧 *Claude wants to use {len(denied_tools)} tool(s):*\n\n"
-        f"{tool_text}\n\n"
-        f"Approve execution?"
-    )
-
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("✅ Approve", callback_data=f"approve_{request_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_{request_id}"),
-        ]
-    ])
-
-    await _app.bot.send_message(
-        chat_id=chat_id,
-        text=msg_text,
-        parse_mode="Markdown",
-        reply_markup=keyboard,
-        message_thread_id=thread_id,
-    )
-
-    # Return None to signal that we're waiting for approval
-    return None
+    answer = result_text or "Claude returned an empty response."
+    label = project if project else "general"
+    return f"[{label}]\n{answer}"
 
 
 # ---------------------------------------------------------------------------
@@ -886,7 +821,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id
     project = _resolve_project(chat_id, thread_id)
     if project:
-        session_id = project_sessions.get(f"{chat_id}_{project}") or sessions.get(chat_id)
+        session_id = project_sessions.get(f"{chat_id}_{project}")  # None = fresh isolated session
     else:
         session_id = sessions.get(chat_id)
 
@@ -943,7 +878,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thread_id = update.message.message_thread_id
     project = _resolve_project(chat_id, thread_id)
     if project:
-        session_id = project_sessions.get(f"{chat_id}_{project}") or sessions.get(chat_id)
+        session_id = project_sessions.get(f"{chat_id}_{project}")  # None = fresh isolated session
     else:
         session_id = sessions.get(chat_id)
 
@@ -1350,6 +1285,72 @@ async def _cmd_setup_list(update: Update, chat_id: int):
     await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
+async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/plan <message> — show what Claude would do, then offer Execute/Cancel."""
+    if not is_allowed(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: `/plan <your request>`", parse_mode="Markdown")
+        return
+
+    chat_id = update.effective_chat.id
+    thread_id = update.message.message_thread_id
+    text = " ".join(context.args)
+
+    project = _resolve_project(chat_id, thread_id)
+    if project:
+        session_id = project_sessions.get(f"{chat_id}_{project}")
+    else:
+        session_id = sessions.get(chat_id)
+
+    context_prefix = ""
+    if project:
+        ctx = _get_project_context(project)
+        if ctx:
+            context_prefix = f"[Project context: {project}]\n\n{ctx}\n\n---\n\n"
+
+    plan_prompt = (
+        _PROMPT_PREFIX + context_prefix +
+        "[PLAN ONLY — do not use any tools. Describe step by step what you would do "
+        "to complete the following request, but do not execute anything yet.]\n\n" + text
+    )
+    full_prompt = _PROMPT_PREFIX + context_prefix + text
+
+    await update.message.reply_chat_action("typing")
+    try:
+        _, _, plan_text = await _run_claude(
+            prompt=plan_prompt,
+            session_id=session_id,
+            skip_permissions=False,
+            max_turns=3,
+        )
+    except asyncio.TimeoutError:
+        await update.message.reply_text(f"⏱ Timed out.")
+        return
+
+    plan_text = plan_text or "Claude could not produce a plan."
+
+    # Store the real prompt for execution
+    request_id = str(uuid.uuid4())[:8]
+    pending_approvals[request_id] = {
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "prompt": full_prompt,
+        "session_id_before": session_id,
+    }
+
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("▶️ Execute", callback_data=f"approve_{request_id}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"reject_{request_id}"),
+        ]
+    ])
+
+    for chunk in split_message(f"📋 *Plan:*\n\n{plan_text}"):
+        await update.message.reply_text(chunk, parse_mode="Markdown")
+    await update.message.reply_text("Execute this plan?", reply_markup=keyboard)
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -1377,6 +1378,7 @@ def main():
     _app.add_handler(CommandHandler("sessions", cmd_sessions))
     _app.add_handler(CommandHandler("find", cmd_find))
     _app.add_handler(CommandHandler("setup", cmd_setup))
+    _app.add_handler(CommandHandler("plan", cmd_plan))
     _app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     _app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     _app.add_handler(MessageHandler(filters.Document.ALL, handle_document))

@@ -16,10 +16,42 @@ Claude Code normally requires you to be at your computer. This bridge lets you u
 
 **No API key needed.** Uses the Claude Code CLI with your existing Claude subscription (Pro or Max). Not charged per token.
 
-## Quick setup (macOS)
+## Step 1 — Create your Telegram bot
+
+1. Open Telegram and search for **@BotFather**
+2. Send `/newbot`
+3. Choose a name (e.g. "My Claude Bridge")
+4. Choose a username ending in `bot` (e.g. `myclaudebridge_bot`)
+5. BotFather gives you a token like `123456789:ABCdef...` — **copy it**
+
+**Find your Telegram user ID:**
+1. Message **@userinfobot** on Telegram
+2. It replies with your user ID (a number like `301192776`)
+3. You'll need this for `ALLOWED_USERS` in `.env`
+
+**Optional — for group/forum use:**
+- In BotFather: `/mybots` → your bot → Bot Settings → Group Privacy → **Disable**
+  (required so the bot can read regular messages in groups, not just commands)
+
+---
+
+## Step 2 — Install Claude Code
+
+Install and authenticate the Claude Code CLI on your Mac:
 
 ```bash
-git clone https://github.com/yourname/telegram-claude-bridge
+npm install -g @anthropic-ai/claude-code
+claude   # opens browser to authenticate with your Claude subscription
+```
+
+Requires a Claude Pro or Max subscription.
+
+---
+
+## Step 3 — Install the bridge
+
+```bash
+git clone https://github.com/vlrmzz/telegram-claude-bridge
 cd telegram-claude-bridge
 ./setup.sh
 ```

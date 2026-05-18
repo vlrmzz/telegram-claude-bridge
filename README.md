@@ -26,7 +26,7 @@ Claude Code normally requires you to be at your computer. This bridge lets you u
 
 **Find your Telegram user ID:**
 1. Message **@userinfobot** on Telegram
-2. It replies with your user ID (a number like `301192776`)
+2. It replies with your user ID (a number like `123456789`)
 3. You'll need this for `ALLOWED_USERS` in `.env`
 
 **Optional — for group/forum use:**

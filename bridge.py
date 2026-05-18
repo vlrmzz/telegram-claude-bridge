@@ -504,6 +504,12 @@ _PROMPT_PREFIX = (
     "Important: always provide a complete, fresh answer. "
     "Do not say 'already answered' or refer to previous responses — "
     "just answer fully as if for the first time.\n\n"
+    "TOOL USE RULES:\n"
+    "- READ-ONLY operations (reading files, listing directories, searching, summarizing): proceed directly without asking.\n"
+    "- WRITE operations (editing files, creating files, deleting files, running bash/shell commands, writing data): "
+    "describe exactly what you are about to do and STOP. Do not execute yet. "
+    "Wait for the user to explicitly confirm with 'yes', 'do it', 'go ahead', or similar before proceeding.\n"
+    "- If the user's message already contains explicit confirmation (e.g. 'go ahead and edit', 'yes do it'), you may proceed directly.\n\n"
 )
 
 

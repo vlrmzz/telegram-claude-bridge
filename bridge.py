@@ -114,6 +114,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 log = logging.getLogger(__name__)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # suppress token-exposing API URLs
 
 # Per-chat state
 SESSIONS_FILE = Path(__file__).parent / "sessions.json"

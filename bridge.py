@@ -691,17 +691,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_chat_action("typing")
 
-    # Auto web search if transcript triggers it
-    search_context = ""
-    if _needs_search(transcript) and OPENROUTER_API_KEY:
-        await update.message.reply_text("🔍 Searching the web...", do_quote=True)
-        results = await perplexity_search(transcript)
-        if results:
-            search_context = f"\n\n[Web search results for context:]\n{results}\n\n"
-
     thread_id = update.message.message_thread_id
     try:
-        response = await send_to_claude(transcript + search_context, chat_id, thread_id=thread_id)
+        response = await send_to_claude(transcript, chat_id, thread_id=thread_id)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
         return
@@ -733,17 +725,9 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_chat_action("typing")
 
-    # Auto web search if message triggers it
-    search_context = ""
-    if _needs_search(text) and OPENROUTER_API_KEY:
-        await update.message.reply_text("🔍 Searching the web...", do_quote=True)
-        results = await perplexity_search(text)
-        if results:
-            search_context = f"\n\n[Web search results for context:]\n{results}\n\n"
-
     thread_id = update.message.message_thread_id
     try:
-        response = await send_to_claude(text + search_context, chat_id, thread_id=thread_id)
+        response = await send_to_claude(text, chat_id, thread_id=thread_id)
     except asyncio.TimeoutError:
         await update.message.reply_text(f"⏱ Timed out after {CLAUDE_TIMEOUT}s — the command took too long.")
         return
@@ -1041,8 +1025,8 @@ def _extract_image_paths(text: str) -> list[str]:
     """Find local file paths in text that point to existing image files."""
     import re
     found = []
-    for m in re.finditer(r'(/(?:Users|home|tmp)/[^\s\)\]\'"]+)', text):
-        p = Path(m.group(1))
+    for m in re.finditer(r'(/(?:Users|home|tmp)/[^\s\)\]`\'"]+)', text):
+        p = Path(m.group(1).rstrip('`\'".,;:'))
         if p.suffix.lower() in _IMAGE_EXTS and p.exists():
             found.append(str(p))
     return list(dict.fromkeys(found))  # deduplicate, preserve order

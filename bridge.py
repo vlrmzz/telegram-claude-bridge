@@ -329,6 +329,7 @@ async def _run_claude(prompt: str, session_id: str | None, skip_permissions: boo
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        cwd=Path(__file__).parent,
     )
     try:
         stdout, stderr = await asyncio.wait_for(

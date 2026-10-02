@@ -28,6 +28,7 @@ echo "[2/5] Installing dependencies..."
 if [ ! -f "$REPO_DIR/.env" ]; then
     echo "[3/5] Creating .env from example..."
     cp "$REPO_DIR/.env.example" "$REPO_DIR/.env"
+    chmod 600 "$REPO_DIR/.env"
     echo "      ⚠️  Edit $REPO_DIR/.env and fill in your tokens before starting."
 else
     echo "[3/5] .env already exists, skipping."
@@ -46,14 +47,14 @@ else
     echo "[4/5] ⚠️  claude CLI not found in PATH. Install it and update CLAUDE_PATH in .env"
 fi
 
-# 5. Detect Node path (needed for claude CLI)
+# Detect Node path (needed for claude CLI)
 NODE_PATH="$(dirname "$(which node 2>/dev/null || echo '/usr/bin/node')")"
 NVM_NODE="$(ls "$HOME/.nvm/versions/node/" 2>/dev/null | sort -V | tail -1)"
 if [ -n "$NVM_NODE" ]; then
     NODE_PATH="$HOME/.nvm/versions/node/$NVM_NODE/bin"
 fi
 
-# 6. Create launchctl plist
+# 5. Create launchctl plist
 echo "[5/5] Creating launchctl plist at $PLIST_PATH..."
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -70,7 +71,7 @@ cat > "$PLIST_PATH" <<EOF
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>${NODE_PATH}:/usr/local/bin:/usr/bin:/bin</string>
+        <string>${NODE_PATH}:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
     </dict>
     <key>WorkingDirectory</key>
     <string>${REPO_DIR}</string>

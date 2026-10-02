@@ -1,3 +1,6 @@
 python-telegram-bot>=21.0
 faster-whisper>=1.0.0
 python-dotenv>=1.0.0
+# Optional features
+edge-tts>=6.1.0   # spoken replies (/voice on) — also needs ffmpeg on PATH
+openai>=1.0.0     # /search via OpenRouter

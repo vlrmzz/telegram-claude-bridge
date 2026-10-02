@@ -57,16 +57,8 @@ Thumbs.db
 
 # Session state (persisted locally, not for version control)
 sessions.json
-sessions_baby.json
 project_sessions.json
 active_project.json
-
-# Baby tracker (personal/optional — not part of generic repo)
-baby_bot.py
-baby_bot.log
-baby_bot.error.log
-baby_data.json
-baby_sessions.json
 
 # Forum topic mappings (personal — contains your chat/thread IDs)
 topics.json
